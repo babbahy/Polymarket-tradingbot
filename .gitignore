@@ -5,42 +5,56 @@ bin/
 *.so
 *.dylib
 
-# Test artifacts
+# Test binaries
 *.test
 *.out
-coverage.out
-coverage.html
 
 # Go workspace file
 go.work
 
-# Environment files
-.env
-.env.local
+# Dependency directories
+vendor/
 
-# IDEs
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS files
+# OS
 .DS_Store
 Thumbs.db
 
-# Data files
+# Logs
+*.log
+logs/
+data/
+
+# Config with secrets
+configs/config.local.yaml
+.env
+.env.local
+
+# SQLite databases
 *.db
 *.sqlite
 *.sqlite3
-data/
-logs/
+
+# Metrics data
+prometheus_data/
+
+# Coverage
+coverage.out
+coverage.html
 
 # Temporary files
 tmp/
 temp/
 *.tmp
 
-# Build artifacts
-dist/
-build/
+# API keys (IMPORTANT!)
+**/secrets/
+**/*_secret*
+**/*.key
+**/*.pem
