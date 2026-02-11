@@ -1,0 +1,31 @@
+mode: "paper"
+
+polymarket:
+  api_url: "https://clob.polymarket.com"
+  api_key: ""
+  api_secret: ""
+  requests_per_second: 10
+
+arbitrage:
+  min_profit_bps: 10  # Lowered to 0.1% to see what exists
+
+execution:
+  slippage_model: "sqrt"
+  max_slippage_bps: 100
+
+storage:
+  backend: "sqlite"
+  sqlite:
+    path: "data/arbitrage.db"
+
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"
+  include_caller: false
+  include_stacktrace: false
+
+metrics:
+  enabled: true
+  port: 9090
+  path: "/metrics"

@@ -1,0 +1,405 @@
+package arbitrage
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"time"
+
+	"github.com/yourusername/polymarket-arbitrage/internal/exchange"
+	"go.uber.org/zap"
+)
+
+// Detector finds arbitrage opportunities in prediction markets
+type Detector struct {
+	client      *exchange.Client
+	logger      *zap.Logger
+	minProfitBps int     // Minimum profit in basis points
+	minLiquidityUSD float64
+}
+
+// NewDetector creates a new arbitrage detector
+func NewDetector(client *exchange.Client, minProfitBps int, minLiquidityUSD float64, logger *zap.Logger) *Detector {
+	return &Detector{
+		client:       client,
+		logger:       logger,
+		minProfitBps: minProfitBps,
+		minLiquidityUSD: minLiquidityUSD,
+	}
+}
+
+// DetectSingleMarketArbitrage finds arbitrage within a single market
+// Paper finding: 41% of conditions showed single-market arbitrage
+// Median mispricing: $0.60 per dollar (should be $1.00)
+func (d *Detector) DetectSingleMarketArbitrage(ctx context.Context, market *exchange.Market) ([]*Opportunity, error) {
+	opportunities := []*Opportunity{}
+	
+	// For binary markets: YES + NO should equal $1.00
+	if len(market.Tokens) == 2 {
+		yesToken := market.Tokens[0]
+		noToken := market.Tokens[1]
+		
+		// Fetch order books
+		yesBook, err := d.client.GetOrderBook(ctx, yesToken.TokenID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get YES orderbook: %w", err)
+		}
+		
+		noBook, err := d.client.GetOrderBook(ctx, noToken.TokenID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get NO orderbook: %w", err)
+		}
+		
+		// Check for buy-both-below-1 arbitrage
+		if len(yesBook.Asks) > 0 && len(noBook.Asks) > 0 {
+			yesBestAsk := yesBook.Asks[0].Price
+			noBestAsk := noBook.Asks[0].Price
+			totalCost := yesBestAsk + noBestAsk
+			
+			if totalCost < 1.0 {
+				profitPerDollar := 1.0 - totalCost
+				profitBps := int(profitPerDollar * 10000)
+				
+				if profitBps >= d.minProfitBps {
+					// Calculate maximum size based on liquidity
+					maxYesSize := yesBook.Asks[0].Size
+					maxNoSize := noBook.Asks[0].Size
+					maxSize := math.Min(maxYesSize, maxNoSize)
+					
+					// Check minimum liquidity requirement
+					availableLiquidity := maxSize * 1.0 // Payout is always $1 per pair
+					if availableLiquidity >= d.minLiquidityUSD {
+						opp := &Opportunity{
+							ID:              fmt.Sprintf("single-%s-%d", market.ID, time.Now().Unix()),
+							Type:            "single_buy_both",
+							MarketID:        market.ID,
+							TokenIDs:        []string{yesToken.TokenID, noToken.TokenID},
+							ExpectedProfit:  profitPerDollar * maxSize,
+							ProfitBps:       profitBps,
+							RequiredCapital: totalCost * maxSize,
+							AvailableLiquidity: availableLiquidity,
+							DetectedAt:      time.Now(),
+							ExpiresAt:       time.Now().Add(5 * time.Second), // Fast expiry
+							Legs: []TradeLeg{
+								{
+									TokenID:     yesToken.TokenID,
+									Side:        exchange.SideBuy,
+									TargetPrice: yesBestAsk,
+									TargetSize:  maxSize,
+								},
+								{
+									TokenID:     noToken.TokenID,
+									Side:        exchange.SideBuy,
+									TargetPrice: noBestAsk,
+									TargetSize:  maxSize,
+								},
+							},
+						}
+						opportunities = append(opportunities, opp)
+						
+						d.logger.Info("Single market arbitrage detected",
+							zap.String("market", market.ID),
+							zap.String("type", "buy_both"),
+							zap.Int("profit_bps", profitBps),
+							zap.Float64("max_size", maxSize),
+						)
+					}
+				}
+			}
+		}
+		
+		// Check for sell-both-above-1 arbitrage
+		if len(yesBook.Bids) > 0 && len(noBook.Bids) > 0 {
+			yesBestBid := yesBook.Bids[0].Price
+			noBestBid := noBook.Bids[0].Price
+			totalRevenue := yesBestBid + noBestBid
+			
+			if totalRevenue > 1.0 {
+				profitPerDollar := totalRevenue - 1.0
+				profitBps := int(profitPerDollar * 10000)
+				
+				if profitBps >= d.minProfitBps {
+					maxYesSize := yesBook.Bids[0].Size
+					maxNoSize := noBook.Bids[0].Size
+					maxSize := math.Min(maxYesSize, maxNoSize)
+					
+					availableLiquidity := maxSize * 1.0
+					if availableLiquidity >= d.minLiquidityUSD {
+						opp := &Opportunity{
+							ID:              fmt.Sprintf("single-%s-%d", market.ID, time.Now().Unix()),
+							Type:            "single_sell_both",
+							MarketID:        market.ID,
+							TokenIDs:        []string{yesToken.TokenID, noToken.TokenID},
+							ExpectedProfit:  profitPerDollar * maxSize,
+							ProfitBps:       profitBps,
+							RequiredCapital: 1.0 * maxSize, // Need to mint pairs first
+							AvailableLiquidity: availableLiquidity,
+							DetectedAt:      time.Now(),
+							ExpiresAt:       time.Now().Add(5 * time.Second),
+							Legs: []TradeLeg{
+								{
+									TokenID:     yesToken.TokenID,
+									Side:        exchange.SideSell,
+									TargetPrice: yesBestBid,
+									TargetSize:  maxSize,
+								},
+								{
+									TokenID:     noToken.TokenID,
+									Side:        exchange.SideSell,
+									TargetPrice: noBestBid,
+									TargetSize:  maxSize,
+								},
+							},
+						}
+						opportunities = append(opportunities, opp)
+						
+						d.logger.Info("Single market arbitrage detected",
+							zap.String("market", market.ID),
+							zap.String("type", "sell_both"),
+							zap.Int("profit_bps", profitBps),
+							zap.Float64("max_size", maxSize),
+						)
+					}
+				}
+			}
+		}
+	}
+	
+	// For categorical markets: sum of all prices should equal $1.00
+	if len(market.Tokens) > 2 {
+		opp, err := d.detectCategoricalArbitrage(ctx, market)
+		if err != nil {
+			d.logger.Warn("Failed to detect categorical arbitrage",
+				zap.String("market", market.ID),
+				zap.Error(err),
+			)
+		} else if opp != nil {
+			opportunities = append(opportunities, opp)
+		}
+	}
+	
+	return opportunities, nil
+}
+
+// detectCategoricalArbitrage finds arbitrage in multi-outcome markets
+// Research: Market rebalancing extracted $29M+ (73% of total)
+func (d *Detector) detectCategoricalArbitrage(ctx context.Context, market *exchange.Market) (*Opportunity, error) {
+	if len(market.Tokens) < 3 {
+		return nil, nil
+	}
+	
+	// Fetch all order books
+	orderBooks := make([]*exchange.OrderBook, len(market.Tokens))
+	for i, token := range market.Tokens {
+		book, err := d.client.GetOrderBook(ctx, token.TokenID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get orderbook for %s: %w", token.TokenID, err)
+		}
+		orderBooks[i] = book
+	}
+	
+	// Check if we can buy all outcomes for less than $1
+	var totalCost float64
+	var minSize float64 = math.MaxFloat64
+	legs := []TradeLeg{}
+	
+	for i, book := range orderBooks {
+		if len(book.Asks) == 0 {
+			return nil, nil // Can't buy if no asks
+		}
+		
+		bestAsk := book.Asks[0].Price
+		totalCost += bestAsk
+		
+		if book.Asks[0].Size < minSize {
+			minSize = book.Asks[0].Size
+		}
+		
+		legs = append(legs, TradeLeg{
+			TokenID:     market.Tokens[i].TokenID,
+			Side:        exchange.SideBuy,
+			TargetPrice: bestAsk,
+			TargetSize:  minSize,
+		})
+	}
+	
+	// Check for arbitrage
+	if totalCost < 1.0 {
+		profitPerDollar := 1.0 - totalCost
+		profitBps := int(profitPerDollar * 10000)
+		
+		if profitBps >= d.minProfitBps {
+			availableLiquidity := minSize * 1.0
+			if availableLiquidity >= d.minLiquidityUSD {
+				return &Opportunity{
+					ID:              fmt.Sprintf("categorical-%s-%d", market.ID, time.Now().Unix()),
+					Type:            "categorical_buy_all",
+					MarketID:        market.ID,
+					TokenIDs:        extractTokenIDs(market.Tokens),
+					ExpectedProfit:  profitPerDollar * minSize,
+					ProfitBps:       profitBps,
+					RequiredCapital: totalCost * minSize,
+					AvailableLiquidity: availableLiquidity,
+					DetectedAt:      time.Now(),
+					ExpiresAt:       time.Now().Add(5 * time.Second),
+					Legs:            legs,
+				}, nil
+			}
+		}
+	}
+	
+	return nil, nil
+}
+
+// DetectCombinatorialArbitrage finds arbitrage across dependent markets
+// Research: 13 confirmed pairs, $95K extracted
+// This is the marginal polytope problem from the paper
+func (d *Detector) DetectCombinatorialArbitrage(ctx context.Context, markets []*exchange.Market, dependencies []Dependency) ([]*Opportunity, error) {
+	opportunities := []*Opportunity{}
+	
+	// Check each dependency pair
+	for _, dep := range dependencies {
+		// Find the two markets
+		var market1, market2 *exchange.Market
+		for _, m := range markets {
+			if m.ID == dep.Market1ID {
+				market1 = m
+			}
+			if m.ID == dep.Market2ID {
+				market2 = m
+			}
+		}
+		
+		if market1 == nil || market2 == nil {
+			continue
+		}
+		
+		// Check dependency constraints
+		opp, err := d.checkDependencyConstraint(ctx, market1, market2, dep)
+		if err != nil {
+			d.logger.Warn("Failed to check dependency",
+				zap.String("market1", market1.ID),
+				zap.String("market2", market2.ID),
+				zap.Error(err),
+			)
+			continue
+		}
+		
+		if opp != nil {
+			opportunities = append(opportunities, opp)
+			
+			d.logger.Info("Combinatorial arbitrage detected",
+				zap.String("market1", market1.ID),
+				zap.String("market2", market2.ID),
+				zap.String("dependency_type", dep.Type),
+				zap.Int("profit_bps", opp.ProfitBps),
+			)
+		}
+	}
+	
+	return opportunities, nil
+}
+
+// checkDependencyConstraint validates logical constraints between markets
+// Example from paper: "If Republicans win PA by 5+, Trump must win PA"
+func (d *Detector) checkDependencyConstraint(ctx context.Context, market1, market2 *exchange.Market, dep Dependency) (*Opportunity, error) {
+	// This is a simplified version - full implementation would use integer programming
+	// to solve the marginal polytope constraints
+	
+	// For now, check basic implication constraints
+	if dep.Type == "implication" {
+		// If market1 outcome implies market2 outcome, then:
+		// P(market1_outcome) <= P(market2_outcome)
+		// Violation creates arbitrage
+		
+		// Fetch prices
+		book1, err := d.client.GetOrderBook(ctx, dep.Token1ID)
+		if err != nil {
+			return nil, err
+		}
+		
+		book2, err := d.client.GetOrderBook(ctx, dep.Token2ID)
+		if err != nil {
+			return nil, err
+		}
+		
+		// Get mid prices
+		price1 := getMidPrice(book1)
+		price2 := getMidPrice(book2)
+		
+		// Check constraint violation
+		if price1 > price2 {
+			// Arbitrage exists: sell market1, buy market2
+			profitPerDollar := price1 - price2
+			profitBps := int(profitPerDollar * 10000)
+			
+			if profitBps >= d.minProfitBps {
+				// Calculate available size
+				size1 := getAvailableSize(book1, exchange.SideSell)
+				size2 := getAvailableSize(book2, exchange.SideBuy)
+				maxSize := math.Min(size1, size2)
+				
+				if maxSize * 1.0 >= d.minLiquidityUSD {
+					return &Opportunity{
+						ID:              fmt.Sprintf("combinatorial-%s-%s-%d", market1.ID, market2.ID, time.Now().Unix()),
+						Type:            "combinatorial_implication",
+						MarketID:        fmt.Sprintf("%s,%s", market1.ID, market2.ID),
+						TokenIDs:        []string{dep.Token1ID, dep.Token2ID},
+						ExpectedProfit:  profitPerDollar * maxSize,
+						ProfitBps:       profitBps,
+						RequiredCapital: price2 * maxSize,
+						AvailableLiquidity: maxSize * 1.0,
+						DetectedAt:      time.Now(),
+						ExpiresAt:       time.Now().Add(10 * time.Second),
+						Legs: []TradeLeg{
+							{
+								TokenID:     dep.Token1ID,
+								Side:        exchange.SideSell,
+								TargetPrice: price1,
+								TargetSize:  maxSize,
+							},
+							{
+								TokenID:     dep.Token2ID,
+								Side:        exchange.SideBuy,
+								TargetPrice: price2,
+								TargetSize:  maxSize,
+							},
+						},
+					}, nil
+				}
+			}
+		}
+	}
+	
+	return nil, nil
+}
+
+// Helper functions
+
+func extractTokenIDs(tokens []exchange.Token) []string {
+	ids := make([]string, len(tokens))
+	for i, token := range tokens {
+		ids[i] = token.TokenID
+	}
+	return ids
+}
+
+func getMidPrice(book *exchange.OrderBook) float64 {
+	if len(book.Bids) == 0 || len(book.Asks) == 0 {
+		return 0
+	}
+	return (book.Bids[0].Price + book.Asks[0].Price) / 2.0
+}
+
+func getAvailableSize(book *exchange.OrderBook, side exchange.Side) float64 {
+	if side == exchange.SideBuy {
+		if len(book.Asks) == 0 {
+			return 0
+		}
+		return book.Asks[0].Size
+	}
+	if len(book.Bids) == 0 {
+		return 0
+	}
+	return book.Bids[0].Size
+}

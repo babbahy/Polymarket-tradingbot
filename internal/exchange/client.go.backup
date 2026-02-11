@@ -1,0 +1,122 @@
+package exchange
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"go.uber.org/zap"
+	"golang.org/x/time/rate"
+)
+
+type Client struct {
+	baseURL     string
+	apiKey      string
+	apiSecret   string
+	httpClient  *http.Client
+	rateLimiter *rate.Limiter
+	logger      *zap.Logger
+}
+
+func NewClient(baseURL, apiKey, apiSecret string, requestsPerSecond int, logger *zap.Logger) *Client {
+	return &Client{
+		baseURL:   baseURL,
+		apiKey:    apiKey,
+		apiSecret: apiSecret,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+		rateLimiter: rate.NewLimiter(rate.Limit(requestsPerSecond), requestsPerSecond*2),
+		logger:      logger,
+	}
+}
+
+// GetMarkets fetches ACTIVE/TRADABLE markets using the SIMPLIFIED endpoint
+func (c *Client) GetMarkets(ctx context.Context) ([]Market, error) {
+	if err := c.rateLimiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("rate limiter error: %w", err)
+	}
+
+	// THE KEY: Use simplified-markets endpoint which returns ONLY active tradable markets
+	url := "https://clob.polymarket.com/simplified-markets"
+	
+	c.logger.Info("Fetching active markets", zap.String("endpoint", url))
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse the simplified markets response
+	var response struct {
+		Data []SimplifiedMarket `json:"data"`
+	}
+	
+	if err := json.Unmarshal(body, &response); err != nil {
+		// Show preview for debugging
+		preview := string(body)
+		if len(preview) > 500 {
+			preview = preview[:500] + "..."
+		}
+		c.logger.Error("Parse error", zap.String("preview", preview))
+		return nil, fmt.Errorf("parse error: %w", err)
+	}
+
+	// Convert simplified markets to our Market format
+	markets := make([]Market, 0, len(response.Data))
+	for _, sm := range response.Data {
+		markets = append(markets, sm.ToMarket())
+	}
+
+	c.logger.Info("Active markets fetched",
+		zap.Int("count", len(markets)),
+		zap.Int("tradable", len(markets)),
+	)
+
+	return markets, nil
+}
+
+func (c *Client) GetMarket(ctx context.Context, marketID string) (*Market, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (c *Client) GetOrderBook(ctx context.Context, tokenID string) (*OrderBook, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (c *Client) CalculateVWAP(orderBook *OrderBook, side Side, targetSize float64) (float64, error) {
+	return 0, fmt.Errorf("not implemented")
+}
+
+func (c *Client) EstimateSlippage(orderBook *OrderBook, side Side, targetSize float64, model string) (float64, error) {
+	return 0, fmt.Errorf("not implemented")
+}
+
+func (c *Client) CheckLiquidity(orderBook *OrderBook, side Side, minLiquidityUSD float64) error {
+	return fmt.Errorf("not implemented")
+}
+
+func (c *Client) Close() error {
+	c.httpClient.CloseIdleConnections()
+	return nil
+}

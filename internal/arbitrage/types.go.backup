@@ -1,0 +1,258 @@
+package arbitrage
+
+import (
+	"time"
+
+	"github.com/yourusername/polymarket-arbitrage/internal/exchange"
+)
+
+// Opportunity represents a detected arbitrage opportunity
+type Opportunity struct {
+	ID                 string
+	Type               string // "single_buy_both", "single_sell_both", "categorical_buy_all", "combinatorial_implication"
+	MarketID           string
+	TokenIDs           []string
+	ExpectedProfit     float64 // Expected profit in USD before slippage
+	EstimatedProfit    float64 // Estimated profit after slippage
+	ProfitBps          int     // Profit in basis points
+	RequiredCapital    float64 // Capital needed to execute
+	AvailableLiquidity float64 // Liquidity available for this trade
+	DetectedAt         time.Time
+	ExpiresAt          time.Time
+	Legs               []TradeLeg
+	RiskScore          float64 // 0-1, higher = riskier
+	ExecutionPlan      *ExecutionPlan
+}
+
+// TradeLeg represents one trade in a multi-leg arbitrage
+type TradeLeg struct {
+	TokenID       string
+	Side          exchange.Side
+	TargetPrice   float64
+	TargetSize    float64
+	ExpectedVWAP  float64
+	MaxSlippage   float64
+	OrderType     exchange.OrderType
+	TimeInForce   string
+}
+
+// ExecutionPlan describes how to execute an arbitrage opportunity
+type ExecutionPlan struct {
+	OpportunityID string
+	Legs          []PlannedLeg
+	TotalCost     float64
+	ExpectedPayout float64
+	ExpectedProfit float64
+	MaxSlippage    float64
+	EstimatedGas   float64
+	Priority       int // 1=highest, higher numbers = lower priority
+	SubmitInParallel bool
+}
+
+// PlannedLeg is a leg with execution details
+type PlannedLeg struct {
+	TradeLeg
+	OrderID        string
+	ActualVWAP     float64
+	ActualSize     float64
+	ActualSlippage float64
+	Status         string // "pending", "submitted", "partial", "filled", "failed"
+}
+
+// Dependency represents a logical dependency between two markets
+type Dependency struct {
+	Market1ID string
+	Market2ID string
+	Token1ID  string
+	Token2ID  string
+	Type      string // "implication", "mutual_exclusion", "conditional"
+	
+	// Constraint description
+	// For implication: Token1 => Token2, so P(Token1) <= P(Token2)
+	// For mutual exclusion: Token1 XOR Token2, so P(Token1) + P(Token2) <= 1
+	// For conditional: P(Token1 AND Token2) = specified value
+	Constraint string
+	
+	// Valid outcome combinations
+	ValidOutcomes [][]int // Each row is a valid combination of outcomes
+}
+
+// DependencyGraph represents the full graph of market dependencies
+type DependencyGraph struct {
+	Markets      map[string]*MarketNode
+	Dependencies []Dependency
+}
+
+// MarketNode represents a market in the dependency graph
+type MarketNode struct {
+	MarketID    string
+	Tokens      []string
+	NumOutcomes int
+	Parents     []string // Markets this depends on
+	Children    []string // Markets that depend on this
+}
+
+// ConstraintSet represents the marginal polytope constraints
+// From paper: Z = {z ∈ {0,1}^I : A^T × z ≥ b}
+type ConstraintSet struct {
+	// Integer programming formulation
+	// Variables: z[i] ∈ {0,1} for each outcome i
+	NumVariables int
+	
+	// Constraint matrix A and vector b
+	// Each row: sum(A[j,i] * z[i]) >= b[j]
+	ConstraintMatrix [][]float64 // A^T
+	ConstraintVector []float64   // b
+	
+	// Market structure
+	MarketIDs []string
+	TokenIDs  []string
+}
+
+// ArbitrageStats tracks detection and execution statistics
+type ArbitrageStats struct {
+	// Detection
+	OpportunitiesDetected     int
+	SingleMarketCount         int
+	CategoricalCount          int
+	CombinatorialCount        int
+	
+	// Execution
+	OpportunitiesExecuted     int
+	OpportunitiesRejected     int
+	
+	// Reasons for rejection
+	RejectedInsufficientLiquidity int
+	RejectedHighSlippage          int
+	RejectedRiskCheck             int
+	RejectedExpired               int
+	
+	// Profitability
+	TotalProfitUSD            float64
+	TotalCapitalDeployed      float64
+	AverageProfitPerTrade     float64
+	MedianProfitBps           int
+	
+	// Performance
+	AverageDetectionLatencyMs float64
+	AverageExecutionLatencyMs float64
+	
+	LastUpdated               time.Time
+}
+
+// OpportunityFilter defines filters for opportunity selection
+type OpportunityFilter struct {
+	MinProfitBps       int
+	MinProfitUSD       float64
+	MaxSlippageBps     int
+	MinLiquidityUSD    float64
+	MaxCapitalUSD      float64
+	MaxRiskScore       float64
+	AllowedTypes       []string
+	RequiredMarkets    []string
+	ExcludedMarkets    []string
+}
+
+// Matches checks if an opportunity passes the filter
+func (f *OpportunityFilter) Matches(opp *Opportunity) bool {
+	if opp.ProfitBps < f.MinProfitBps {
+		return false
+	}
+	
+	if opp.ExpectedProfit < f.MinProfitUSD {
+		return false
+	}
+	
+	if opp.AvailableLiquidity < f.MinLiquidityUSD {
+		return false
+	}
+	
+	if opp.RequiredCapital > f.MaxCapitalUSD {
+		return false
+	}
+	
+	if opp.RiskScore > f.MaxRiskScore {
+		return false
+	}
+	
+	// Check type filter
+	if len(f.AllowedTypes) > 0 {
+		found := false
+		for _, t := range f.AllowedTypes {
+			if opp.Type == t {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	
+	// Check market filters
+	for _, excluded := range f.ExcludedMarkets {
+		if opp.MarketID == excluded {
+			return false
+		}
+	}
+	
+	return true
+}
+
+// PriorityScore calculates a priority score for the opportunity
+// Higher score = higher priority
+func (o *Opportunity) PriorityScore() float64 {
+	// Combine profit, liquidity, and risk into a score
+	profitScore := float64(o.ProfitBps) / 100.0
+	liquidityScore := o.AvailableLiquidity / 10000.0 // Normalize
+	riskPenalty := o.RiskScore * 100.0
+	
+	return profitScore + liquidityScore - riskPenalty
+}
+
+// IsExpired checks if the opportunity has expired
+func (o *Opportunity) IsExpired() bool {
+	return time.Now().After(o.ExpiresAt)
+}
+
+// EstimateExecutionRisk calculates a risk score for the opportunity
+func (o *Opportunity) EstimateExecutionRisk() float64 {
+	var riskScore float64
+	
+	// Risk from number of legs (more legs = higher risk)
+	legRisk := float64(len(o.Legs)) * 0.1
+	
+	// Risk from capital requirement
+	capitalRisk := 0.0
+	if o.RequiredCapital > 10000 {
+		capitalRisk = 0.2
+	} else if o.RequiredCapital > 5000 {
+		capitalRisk = 0.1
+	}
+	
+	// Risk from liquidity
+	liquidityRisk := 0.0
+	if o.AvailableLiquidity < 1000 {
+		liquidityRisk = 0.3
+	} else if o.AvailableLiquidity < 5000 {
+		liquidityRisk = 0.15
+	}
+	
+	// Risk from time to expiry
+	timeToExpiry := time.Until(o.ExpiresAt).Seconds()
+	timeRisk := 0.0
+	if timeToExpiry < 2 {
+		timeRisk = 0.4
+	} else if timeToExpiry < 5 {
+		timeRisk = 0.2
+	}
+	
+	riskScore = legRisk + capitalRisk + liquidityRisk + timeRisk
+	
+	// Normalize to 0-1
+	if riskScore > 1.0 {
+		riskScore = 1.0
+	}
+	
+	return riskScore
+}

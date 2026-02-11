@@ -1,0 +1,50 @@
+# Market Definitions
+# Configure specific markets for arbitrage detection
+
+# Market groups for multi-market arbitrage
+market_groups:
+  - name: "US_Elections_2024"
+    description: "2024 US Presidential Election markets"
+    markets:
+      # Example market IDs - replace with actual Polymarket condition IDs
+      - condition_id: "0x1234..."
+        name: "Presidential Winner"
+        min_liquidity: 10000
+      - condition_id: "0x5678..."
+        name: "Electoral College Total"
+        min_liquidity: 5000
+    
+  - name: "Sports_NBA"
+    description: "NBA Championship markets"
+    markets:
+      - condition_id: "0xabcd..."
+        name: "NBA Champion 2024"
+        min_liquidity: 8000
+
+# Custom market parameters
+custom_params:
+  # Override default risk limits for specific markets
+  "0x1234...":
+    max_notional: 15000
+    max_slippage_bps: 75
+    
+  "0x5678...":
+    max_notional: 8000
+    max_slippage_bps: 100
+
+# Arbitrage relationships
+# Define known dependency structures for faster detection
+relationships:
+  - type: "mutually_exclusive"
+    description: "Presidential election outcomes"
+    markets:
+      - "0x1234..."
+      - "0x5678..."
+    constraint: "probabilities_sum_to_one"
+    
+  - type: "conditional"
+    description: "NBA playoffs dependency"
+    parent: "0xabcd..."
+    children:
+      - "0xdef0..."
+      - "0x1111..."

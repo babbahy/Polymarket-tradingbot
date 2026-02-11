@@ -1,0 +1,129 @@
+# Risk Management Limits
+# ALL limits are enforced before any trade execution
+
+# Position limits
+position:
+  # Maximum notional value per market (USD)
+  max_notional_per_market: 10000
+  
+  # Maximum total notional across all markets (USD)
+  max_total_notional: 50000
+  
+  # Maximum number of open positions
+  max_open_positions: 20
+  
+  # Maximum inventory skew (prevents directional exposure)
+  # Value between 0 and 1, where 0.5 = balanced, 1.0 = 100% long
+  max_inventory_skew: 0.7
+
+# Order limits
+orders:
+  # Maximum number of open orders
+  max_open_orders: 50
+  
+  # Maximum order size (USD)
+  max_order_size: 5000
+  
+  # Minimum order size (USD)
+  min_order_size: 10
+  
+  # Maximum orders per market
+  max_orders_per_market: 10
+
+# Daily risk limits
+daily:
+  # Maximum daily loss (USD)
+  max_daily_loss: 5000
+  
+  # Maximum daily profit (for circuit breaker)
+  max_daily_profit: 20000
+  
+  # Maximum number of trades per day
+  max_trades_per_day: 500
+  
+  # Daily loss reset time (UTC)
+  reset_time: "00:00:00"
+
+# Market-specific limits
+market:
+  # Minimum market liquidity to participate (USD)
+  min_market_liquidity: 5000
+  
+  # Maximum spread to participate (basis points)
+  max_spread_bps: 500  # 5%
+  
+  # Blacklisted markets (condition IDs)
+  blacklist: []
+  
+  # Whitelisted markets (if non-empty, only these are traded)
+  whitelist: []
+
+# Concentration limits
+concentration:
+  # Maximum exposure to single market (% of total capital)
+  max_market_concentration: 0.30  # 30%
+  
+  # Maximum exposure to single event (% of total capital)
+  max_event_concentration: 0.50  # 50%
+
+# Kill switch settings
+kill_switch:
+  enabled: true
+  
+  # Triggers for automatic kill switch
+  triggers:
+    # Trigger on daily loss limit breach
+    on_daily_loss: true
+    
+    # Trigger on position limit breach
+    on_position_limit: true
+    
+    # Trigger on error rate threshold
+    on_error_rate: true
+    error_rate_threshold: 0.20  # 20% of trades
+    error_rate_window: 100  # trades
+    
+    # Trigger on API connection loss
+    on_connection_loss: true
+    connection_timeout: 30  # seconds
+  
+  # Actions when kill switch is triggered
+  actions:
+    cancel_all_orders: true
+    close_positions: false  # manual intervention required
+    send_alert: true
+    
+  # Manual override required to resume after kill switch
+  require_manual_reset: true
+
+# Pre-trade risk checks
+pre_trade_checks:
+  # Check position limits
+  check_position_limits: true
+  
+  # Check order limits
+  check_order_limits: true
+  
+  # Check daily loss limit
+  check_daily_limits: true
+  
+  # Simulate execution and check slippage
+  check_execution_quality: true
+  
+  # Verify market liquidity
+  check_market_liquidity: true
+  
+  # Check for stale prices
+  check_price_staleness: true
+  max_price_age_seconds: 10
+
+# Alerts and notifications
+alerts:
+  # Alert on approaching limits (% of limit)
+  warn_threshold: 0.80  # 80%
+  
+  # Alert channels
+  channels:
+    - "log"  # Always log
+    # - "email"  # Configure via environment
+    # - "slack"  # Configure via environment

@@ -1,0 +1,368 @@
+package exchange
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"go.uber.org/zap"
+)
+
+// WebSocketClient handles real-time market data via WebSocket
+type WebSocketClient struct {
+	url            string
+	conn           *websocket.Conn
+	logger         *zap.Logger
+	mu             sync.RWMutex
+	subscriptions  map[string]bool
+	handlers       map[string][]MessageHandler
+	done           chan struct{}
+	reconnectDelay time.Duration
+}
+
+// MessageHandler processes incoming WebSocket messages
+type MessageHandler func(msg *WebSocketMessage) error
+
+// WebSocketMessage represents a WebSocket message
+type WebSocketMessage struct {
+	Type      string          `json:"type"`
+	Channel   string          `json:"channel"`
+	Market    string          `json:"market,omitempty"`
+	TokenID   string          `json:"token_id,omitempty"`
+	Data      json.RawMessage `json:"data"`
+	Timestamp time.Time       `json:"timestamp"`
+}
+
+// OrderBookUpdate represents an orderbook update message
+type OrderBookUpdate struct {
+	TokenID   string      `json:"token_id"`
+	Bids      []BookLevel `json:"bids"`
+	Asks      []BookLevel `json:"asks"`
+	Timestamp time.Time   `json:"timestamp"`
+	Hash      string      `json:"hash"`
+}
+
+// TradeUpdate represents a trade execution message
+type TradeUpdate struct {
+	TokenID   string    `json:"token_id"`
+	Price     float64   `json:"price"`
+	Size      float64   `json:"size"`
+	Side      Side      `json:"side"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// NewWebSocketClient creates a new WebSocket client
+func NewWebSocketClient(url string, logger *zap.Logger) *WebSocketClient {
+	return &WebSocketClient{
+		url:            url,
+		logger:         logger,
+		subscriptions:  make(map[string]bool),
+		handlers:       make(map[string][]MessageHandler),
+		done:           make(chan struct{}),
+		reconnectDelay: 5 * time.Second,
+	}
+}
+
+// Connect establishes WebSocket connection
+func (ws *WebSocketClient) Connect(ctx context.Context) error {
+	ws.logger.Info("Connecting to WebSocket", zap.String("url", ws.url))
+	
+	dialer := websocket.DefaultDialer
+	dialer.HandshakeTimeout = 10 * time.Second
+	
+	conn, _, err := dialer.DialContext(ctx, ws.url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to connect: %w", err)
+	}
+	
+	ws.mu.Lock()
+	ws.conn = conn
+	ws.mu.Unlock()
+	
+	ws.logger.Info("WebSocket connected successfully")
+	
+	// Start message reader
+	go ws.readLoop()
+	
+	// Start ping/pong keepalive
+	go ws.keepAlive(ctx)
+	
+	return nil
+}
+
+// SubscribeOrderBook subscribes to orderbook updates for a token
+func (ws *WebSocketClient) SubscribeOrderBook(ctx context.Context, tokenID string, handler MessageHandler) error {
+	channel := fmt.Sprintf("orderbook:%s", tokenID)
+	
+	ws.mu.Lock()
+	if ws.handlers[channel] == nil {
+		ws.handlers[channel] = []MessageHandler{}
+	}
+	ws.handlers[channel] = append(ws.handlers[channel], handler)
+	ws.subscriptions[channel] = true
+	ws.mu.Unlock()
+	
+	// Send subscription message
+	msg := map[string]interface{}{
+		"type":     "subscribe",
+		"channel":  "orderbook",
+		"token_id": tokenID,
+	}
+	
+	return ws.sendMessage(msg)
+}
+
+// SubscribeTrades subscribes to trade updates for a token
+func (ws *WebSocketClient) SubscribeTrades(ctx context.Context, tokenID string, handler MessageHandler) error {
+	channel := fmt.Sprintf("trades:%s", tokenID)
+	
+	ws.mu.Lock()
+	if ws.handlers[channel] == nil {
+		ws.handlers[channel] = []MessageHandler{}
+	}
+	ws.handlers[channel] = append(ws.handlers[channel], handler)
+	ws.subscriptions[channel] = true
+	ws.mu.Unlock()
+	
+	// Send subscription message
+	msg := map[string]interface{}{
+		"type":     "subscribe",
+		"channel":  "trades",
+		"token_id": tokenID,
+	}
+	
+	return ws.sendMessage(msg)
+}
+
+// Unsubscribe removes a subscription
+func (ws *WebSocketClient) Unsubscribe(ctx context.Context, channel string) error {
+	ws.mu.Lock()
+	delete(ws.subscriptions, channel)
+	delete(ws.handlers, channel)
+	ws.mu.Unlock()
+	
+	msg := map[string]interface{}{
+		"type":    "unsubscribe",
+		"channel": channel,
+	}
+	
+	return ws.sendMessage(msg)
+}
+
+// readLoop continuously reads messages from WebSocket
+func (ws *WebSocketClient) readLoop() {
+	defer func() {
+		ws.logger.Info("WebSocket read loop stopped")
+		ws.Close()
+	}()
+	
+	for {
+		select {
+		case <-ws.done:
+			return
+		default:
+			ws.mu.RLock()
+			conn := ws.conn
+			ws.mu.RUnlock()
+			
+			if conn == nil {
+				ws.logger.Warn("No WebSocket connection, stopping read loop")
+				return
+			}
+			
+			// Set read deadline
+			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			
+			// Read message
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				ws.logger.Error("Failed to read WebSocket message", zap.Error(err))
+				// Trigger reconnection
+				go ws.reconnect()
+				return
+			}
+			
+			// Parse and handle message
+			var msg WebSocketMessage
+			if err := json.Unmarshal(data, &msg); err != nil {
+				ws.logger.Error("Failed to unmarshal WebSocket message", 
+					zap.Error(err),
+					zap.String("data", string(data)),
+				)
+				continue
+			}
+			
+			msg.Timestamp = time.Now()
+			ws.handleMessage(&msg)
+		}
+	}
+}
+
+// handleMessage processes an incoming message
+func (ws *WebSocketClient) handleMessage(msg *WebSocketMessage) {
+	// Build channel key based on message type
+	var channel string
+	if msg.TokenID != "" {
+		channel = fmt.Sprintf("%s:%s", msg.Type, msg.TokenID)
+	} else {
+		channel = msg.Type
+	}
+	
+	ws.mu.RLock()
+	handlers, exists := ws.handlers[channel]
+	ws.mu.RUnlock()
+	
+	if !exists {
+		ws.logger.Debug("No handlers for channel",
+			zap.String("channel", channel),
+			zap.String("type", msg.Type),
+		)
+		return
+	}
+	
+	// Call all registered handlers
+	for _, handler := range handlers {
+		if err := handler(msg); err != nil {
+			ws.logger.Error("Handler error",
+				zap.String("channel", channel),
+				zap.Error(err),
+			)
+		}
+	}
+}
+
+// sendMessage sends a message over WebSocket
+func (ws *WebSocketClient) sendMessage(msg interface{}) error {
+	ws.mu.RLock()
+	conn := ws.conn
+	ws.mu.RUnlock()
+	
+	if conn == nil {
+		return fmt.Errorf("no active connection")
+	}
+	
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal message: %w", err)
+	}
+	
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	
+	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		return fmt.Errorf("failed to write message: %w", err)
+	}
+	
+	return nil
+}
+
+// keepAlive sends periodic ping messages
+func (ws *WebSocketClient) keepAlive(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ws.done:
+			return
+		case <-ticker.C:
+			ws.mu.RLock()
+			conn := ws.conn
+			ws.mu.RUnlock()
+			
+			if conn == nil {
+				continue
+			}
+			
+			ws.mu.Lock()
+			err := conn.WriteMessage(websocket.PingMessage, []byte{})
+			ws.mu.Unlock()
+			
+			if err != nil {
+				ws.logger.Warn("Failed to send ping", zap.Error(err))
+			}
+		}
+	}
+}
+
+// reconnect attempts to re-establish connection
+func (ws *WebSocketClient) reconnect() {
+	ws.logger.Info("Attempting to reconnect WebSocket...")
+	
+	// Close existing connection
+	ws.mu.Lock()
+	if ws.conn != nil {
+		ws.conn.Close()
+		ws.conn = nil
+	}
+	ws.mu.Unlock()
+	
+	// Wait before reconnecting
+	time.Sleep(ws.reconnectDelay)
+	
+	// Reconnect
+	ctx := context.Background()
+	if err := ws.Connect(ctx); err != nil {
+		ws.logger.Error("Failed to reconnect", zap.Error(err))
+		// Try again
+		go ws.reconnect()
+		return
+	}
+	
+	// Resubscribe to all channels
+	ws.mu.RLock()
+	subscriptions := make([]string, 0, len(ws.subscriptions))
+	for channel := range ws.subscriptions {
+		subscriptions = append(subscriptions, channel)
+	}
+	ws.mu.RUnlock()
+	
+	for _, channel := range subscriptions {
+		msg := map[string]interface{}{
+			"type":    "subscribe",
+			"channel": channel,
+		}
+		if err := ws.sendMessage(msg); err != nil {
+			ws.logger.Error("Failed to resubscribe",
+				zap.String("channel", channel),
+				zap.Error(err),
+			)
+		}
+	}
+	
+	ws.logger.Info("WebSocket reconnected and resubscribed")
+}
+
+// Close gracefully closes the WebSocket connection
+func (ws *WebSocketClient) Close() error {
+	ws.logger.Info("Closing WebSocket connection")
+	
+	close(ws.done)
+	
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	
+	if ws.conn != nil {
+		// Send close message
+		err := ws.conn.WriteMessage(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		)
+		if err != nil {
+			ws.logger.Warn("Error sending close message", zap.Error(err))
+		}
+		
+		// Close connection
+		if err := ws.conn.Close(); err != nil {
+			return fmt.Errorf("failed to close connection: %w", err)
+		}
+		ws.conn = nil
+	}
+	
+	return nil
+}
